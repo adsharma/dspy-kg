@@ -2,11 +2,12 @@ import os
 import dspy
 import duckdb
 import pandas as pd
-import networkx as nx
-import matplotlib.pyplot as plt
+import kuzu
+import shutil
 from pydantic import BaseModel, Field
 from nltk.tokenize import sent_tokenize
 from dotenv import load_dotenv
+from typing import List
 
 # Load environment variables from .env file
 load_dotenv()
@@ -23,29 +24,31 @@ def load_schema_relationships(domain):
     schema_conn = duckdb.connect("schema_relationships.duckdb", read_only=True)
     schema_result = schema_conn.execute(
         f"""
-        SELECT '' as first_entity, subject as first_entity_type, predicate as relationship, '' as second_entity, object as second_entity_type,
+        SELECT subject as first_entity_type, predicate as relationship, object as second_entity_type
         FROM schema_relationships WHERE domain = 'base' OR domain = '{domain}'
         """
     ).df()
-    examples = [EntityRelations(**row) for index, row in schema_result.iterrows()]
 
     schema_conn.close()
     print(f"Loaded {len(schema_result)} relations from schema_relationships.duckdb")
-    return examples
+    return schema_result
+
+
+class Entity(BaseModel):
+    id: int
+    name: str
+    type: str
+
+
+class Relations(BaseModel):
+    first: int = Field(..., description="ID of the first entity")
+    type: str = Field(..., description="Type of the relationship")
+    second: int = Field(..., description="ID of the second entity")
 
 
 class EntityRelations(BaseModel):
-    first_entity: str = Field(
-        ..., description="The first entity in the relationship with a type"
-    )
-    first_entity_type: str = Field(..., description="The type of the first entity")
-    relationship: str = Field(
-        ..., description="The relationship between the two entities, should be a verb"
-    )
-    second_entity: str = Field(
-        ..., description="The second entity in the relationship with a type"
-    )
-    second_entity_type: str = Field(..., description="The type of the second entity")
+    entities: List[Entity]
+    relations: List[Relations]
 
 
 class EntityExtractionWithSchema(dspy.Signature):
@@ -64,25 +67,21 @@ class EntityExtraction(dspy.Module):
         self.extract = dspy.ChainOfThought(EntityExtractionWithSchema)
         self.positive_examples = [
             EntityRelations(
-                first_entity="Bill Clinton",
-                first_entity_type="Person",
-                relationship="memberOf",
-                second_entity="President",
-                second_entity_type="Person",
+                entities=[Entity(id=1, name="Bill Clinton", type="Person")],
+                relations=[Relations(first=1, second=2, type="memberOf")],
             ),
             EntityRelations(
-                first_entity="Barack Obama",
-                first_entity_type="Person",
-                relationship="spouse",
-                second_entity="Michelle Obama",
-                second_entity_type="Person",
+                entities=[
+                    Entity(id=3, name="Barack Obama", type="Person"),
+                    Entity(id=4, name="Michelle Obama", type="Person"),
+                ],
+                relations=[Relations(first=3, second=4, type="spouse")],
             ),
         ]
-        # self.negative_examples = [EntityRelations(first_entity='Person', relationship='memberOf', second_entity='Organization')]
         # convert schema_df to cypher like string
         schema_str = "\n".join(
-            f"(({row.first_entity_type})-[:{row.relationship}]->({row.second_entity_type}))"
-            for row in schema_df
+            f"(({row[0]})-[:{row[1]}]->({row[2]}))"
+            for row in schema_df.itertuples(index=False)
         )
         self.schema_string = "Valid relationships: " + schema_str
         print(self.schema_string)
@@ -91,58 +90,135 @@ class EntityExtraction(dspy.Module):
         return self.extract(text=text, relationship_schema=self.schema_string)
 
 
-module = EntityExtraction(load_schema_relationships("politics"))
-
-
-def extract_entities_and_relations(extractor, sentence):
+def extract_entities_and_relations(module, sentence):
     return module(sentence).entities
 
 
-def build_knowledge_graph(extractor, text):
-    sentences = sent_tokenize(text)
-    graph = nx.DiGraph()
-
-    for sentence in sentences:
-        try:
-            ER = extract_entities_and_relations(extractor, sentence)
-            print(f"Extracted: {ER}")
-            entity1 = ER.first_entity
-            entity2 = ER.second_entity
-            relationship = ER.relationship
-            if entity1 and entity2:
-                graph.add_node(entity1)
-                graph.add_node(entity2)
-                graph.add_edge(entity1, entity2, relation=relationship)
-        except Exception as e:
-            print(
-                f"Failed to extract or add entities for the sentence '{sentence}': {e}"
-            )
-
-    draw_knowledge_graph(graph)
-
-
-def draw_knowledge_graph(graph):
-    pos = nx.spring_layout(graph)
-    plt.figure(figsize=(12, 12))
-    nx.draw(graph, pos, with_labels=True, node_size=300, node_color="skyblue")
-    edge_labels = nx.get_edge_attributes(graph, "relation")
-    nx.draw_networkx_edge_labels(graph, pos, edge_labels)
-    plt.title("Knowledge Graph")
-    plt.show()
-
-
-def configure_dspy():
-    # Using Ollama with configuration from environment variables
+def build_knowledge_graph(text):
+    # Configure DSPy
     lm = dspy.LM(
         model=MODEL_NAME,
         api_base=API_BASE,
         api_key=API_KEY,
     )
     dspy.configure(lm=lm)
-    return dspy.Predict(EntityExtraction)
+
+    # Load schema and create extraction module
+    schema_data = load_schema_relationships("politics")
+    module = EntityExtraction(schema_data)
+
+    sentences = sent_tokenize(text)
+
+    # Initialize KuzuDB database
+    db_path = "knowledge_graph.kuzu"
+    # Remove existing database if it exists
+    if os.path.exists(db_path):
+        if os.path.isdir(db_path):
+            shutil.rmtree(db_path)
+        else:
+            os.remove(db_path)
+
+    db = kuzu.Database(db_path)
+    conn = kuzu.Connection(db)
+
+    # Create node table for entities
+    conn.execute(
+        "CREATE NODE TABLE Entity(name STRING, type STRING, PRIMARY KEY(name))"
+    )
+
+    # Create relationship table
+    conn.execute(
+        "CREATE REL TABLE Relation(FROM Entity TO Entity, relation_type STRING)"
+    )
+
+    for sentence in sentences:
+        try:
+            ER = extract_entities_and_relations(module, sentence)
+            print(f"Extracted: {ER}")
+
+            # Add entities to the graph
+            for e in ER.entities:
+                try:
+                    conn.execute(
+                        f"CREATE (:Entity {{name: '{e.name}', type: '{e.type}'}})"
+                    )
+                except Exception as insert_error:
+                    # Entity might already exist, that's okay
+                    print(f"Entity '{e.name}' might already exist: {insert_error}")
+
+            # Add relationships to the graph
+            for r in ER.relations:
+                try:
+                    # Find entity names by ID
+                    first_entity = next(
+                        (e.name for e in ER.entities if e.id == r.first), None
+                    )
+                    second_entity = next(
+                        (e.name for e in ER.entities if e.id == r.second), None
+                    )
+
+                    if first_entity and second_entity:
+                        query = f"""
+                        MATCH (a:Entity {{name: '{first_entity}'}}), (b:Entity {{name: '{second_entity}'}})
+                        CREATE (a)-[:Relation {{relation_type: '{r.type}'}}]->(b)
+                        """
+                        conn.execute(query)
+                except Exception as rel_error:
+                    print(f"Failed to add relationship: {rel_error}")
+
+        except Exception as e:
+            print(
+                f"Failed to extract or add entities for the sentence '{sentence}': {e}"
+            )
+
+    query_knowledge_graph(conn)
 
 
-entity_extractor = configure_dspy()
+def query_knowledge_graph(conn):
+    """Query and display the knowledge graph stored in KuzuDB"""
+    print("\n=== Knowledge Graph Summary ===")
+
+    # Count entities
+    result = conn.execute("MATCH (e:Entity) RETURN count(*) as entity_count")
+    entity_count = result.get_next()[0]
+    print(f"Total entities: {entity_count}")
+
+    # Count relationships
+    result = conn.execute("MATCH ()-[r:Relation]->() RETURN count(*) as rel_count")
+    rel_count = result.get_next()[0]
+    print(f"Total relationships: {rel_count}")
+
+    # Show all entities
+    print("\n=== Entities ===")
+    result = conn.execute("MATCH (e:Entity) RETURN e.name, e.type ORDER BY e.name")
+    while result.has_next():
+        row = result.get_next()
+        print(f"- {row[0]} ({row[1]})")
+
+    # Show all relationships
+    print("\n=== Relationships ===")
+    result = conn.execute(
+        """
+        MATCH (a:Entity)-[r:Relation]->(b:Entity) 
+        RETURN a.name, r.relation_type, b.name 
+        ORDER BY a.name
+    """
+    )
+    while result.has_next():
+        row = result.get_next()
+        print(f"- {row[0]} --[{row[1]}]--> {row[2]}")
+
+    # Show entities by type
+    print("\n=== Entities by Type ===")
+    # Use implicit grouping in Cypher - group by the non-aggregate expression (e.type)
+    result = conn.execute(
+        "MATCH (e:Entity) RETURN e.type, count(*) ORDER BY count(*) DESC"
+    )
+    while result.has_next():
+        row = result.get_next()
+        print(f"- {row[0]}: {row[1]}")
+
+    print("\n" + "=" * 50)
 
 
 text = """
@@ -164,4 +240,5 @@ the presidency, Confederate forces attacked Fort Sumter, starting the
 Civil War.
 """
 
-build_knowledge_graph(entity_extractor, text)
+if __name__ == "__main__":
+    build_knowledge_graph(text)
