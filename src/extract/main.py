@@ -6,10 +6,15 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from pydantic import BaseModel, Field
 from nltk.tokenize import sent_tokenize
+from dotenv import load_dotenv
 
-# API configuration - set these environment variables or modify as needed
-API_BASE = os.getenv("API_BASE", "http://192.168.68.54:11434")
-API_KEY = os.getenv("API_KEY", "your-api-key-here")
+# Load environment variables from .env file
+load_dotenv()
+
+# API configuration - loaded from environment variables or .env file
+API_BASE = os.getenv("API_BASE", "http://localhost:11434")
+API_KEY = os.getenv("API_KEY", "")
+MODEL_NAME = os.getenv("MODEL_NAME", "ollama_chat/qwen3:30b")
 
 
 def load_schema_relationships(domain):
@@ -17,43 +22,76 @@ def load_schema_relationships(domain):
     # Create a pandas DataFrame with relation labels and constraints from DuckDB
     schema_conn = duckdb.connect("schema_relationships.duckdb", read_only=True)
     schema_result = schema_conn.execute(
-        f"SELECT subject as first_entity, predicate as relationship, object as second_entity FROM schema_relationships WHERE domain = 'base' OR domain = '{domain}'"
+        f"""
+        SELECT '' as first_entity, subject as first_entity_type, predicate as relationship, '' as second_entity, object as second_entity_type,
+        FROM schema_relationships WHERE domain = 'base' OR domain = '{domain}'
+        """
     ).df()
     examples = [EntityRelations(**row) for index, row in schema_result.iterrows()]
 
     schema_conn.close()
     print(f"Loaded {len(schema_result)} relations from schema_relationships.duckdb")
-    print(examples[:5])  # Print first 5 examples for debugging
     return examples
 
 
 class EntityRelations(BaseModel):
-    first_entity: str = Field(..., description="The first entity in the relationship")
+    first_entity: str = Field(
+        ..., description="The first entity in the relationship with a type"
+    )
+    first_entity_type: str = Field(..., description="The type of the first entity")
     relationship: str = Field(
         ..., description="The relationship between the two entities, should be a verb"
     )
-    second_entity: str = Field(..., description="The second entity in the relationship")
+    second_entity: str = Field(
+        ..., description="The second entity in the relationship with a type"
+    )
+    second_entity_type: str = Field(..., description="The type of the second entity")
 
 
-class EntityExtraction(dspy.Signature):
+class EntityExtractionWithSchema(dspy.Signature):
     text: str = dspy.InputField(desc="The text to extract entities from")
+    relationship_schema: str = dspy.InputField(
+        desc="Valid relationship types from schema"
+    )
     entities: EntityRelations = dspy.OutputField(
-        desc="Entities and their relationships extracted from the text"
+        desc="Entities and their relationships extracted from the text. The relationship must be one from the provided schema. "
+        + "Entity types should match the schema. Do NOT output schema itself."
     )
 
 
-class EntityExtractionModule(dspy.Module):
-    def __init__(self, examples):
-        self.extract = dspy.ChainOfThought(EntityExtraction)
-        self.examples = examples
+class EntityExtraction(dspy.Module):
+    def __init__(self, schema_df):
+        self.extract = dspy.ChainOfThought(EntityExtractionWithSchema)
+        self.positive_examples = [
+            EntityRelations(
+                first_entity="Bill Clinton",
+                first_entity_type="Person",
+                relationship="memberOf",
+                second_entity="President",
+                second_entity_type="Person",
+            ),
+            EntityRelations(
+                first_entity="Barack Obama",
+                first_entity_type="Person",
+                relationship="spouse",
+                second_entity="Michelle Obama",
+                second_entity_type="Person",
+            ),
+        ]
+        # self.negative_examples = [EntityRelations(first_entity='Person', relationship='memberOf', second_entity='Organization')]
+        # convert schema_df to cypher like string
+        schema_str = "\n".join(
+            f"(({row.first_entity_type})-[:{row.relationship}]->({row.second_entity_type}))"
+            for row in schema_df
+        )
+        self.schema_string = "Valid relationships: " + schema_str
+        print(self.schema_string)
 
     def forward(self, text):
-        # DSPy will automatically use examples for few-shot prompting
-        with dspy.context(examples=self.examples[:5]):  # Use top 5 examples
-            return self.extract(text=text)
+        return self.extract(text=text, relationship_schema=self.schema_string)
 
 
-module = EntityExtractionModule(load_schema_relationships("politics"))
+module = EntityExtraction(load_schema_relationships("politics"))
 
 
 def extract_entities_and_relations(extractor, sentence):
@@ -66,10 +104,11 @@ def build_knowledge_graph(extractor, text):
 
     for sentence in sentences:
         try:
-            entity1, relationship, entity2 = extract_entities_and_relations(
-                extractor, sentence
-            )
-            print(f"Extracted: {entity1}, {relationship}, {entity2}")
+            ER = extract_entities_and_relations(extractor, sentence)
+            print(f"Extracted: {ER}")
+            entity1 = ER.first_entity
+            entity2 = ER.second_entity
+            relationship = ER.relationship
             if entity1 and entity2:
                 graph.add_node(entity1)
                 graph.add_node(entity2)
@@ -93,9 +132,9 @@ def draw_knowledge_graph(graph):
 
 
 def configure_dspy():
-    # Using Ollama with the correct host
+    # Using Ollama with configuration from environment variables
     lm = dspy.LM(
-        model="ollama_chat/qwen3:30b",
+        model=MODEL_NAME,
         api_base=API_BASE,
         api_key=API_KEY,
     )
