@@ -60,7 +60,7 @@ class EntityExtractionWithSchema(dspy.Signature):
     )
     entities: EntityRelations = dspy.OutputField(
         desc="Entities and their relationships extracted from the text. The relationship must be one from the provided schema. "
-        + "Entity types should match the schema. Do NOT output schema itself."
+        + "Entity types should match the schema. Resolve any pronouns and short names to an entity id with full names."
     )
 
 
@@ -87,9 +87,14 @@ class EntityExtraction(dspy.Module):
         )
         self.schema_string = "Valid relationships: " + schema_str
         print(self.schema_string)
+        self.context = []
 
     def forward(self, text):
-        return self.extract(text=text, relationship_schema=self.schema_string)
+        ER = self.extract(
+            text=text, relationship_schema=self.schema_string, context=self.context
+        )
+        self.context.append(ER.entities)
+        return ER
 
 
 def extract_entities_and_relations(module, sentence):
