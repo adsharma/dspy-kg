@@ -1,5 +1,7 @@
 import os
 import dspy
+import duckdb
+import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
 from pydantic import BaseModel, Field
@@ -8,6 +10,21 @@ from nltk.tokenize import sent_tokenize
 # API configuration - set these environment variables or modify as needed
 API_BASE = os.getenv("API_BASE", "http://192.168.68.54:11434")
 API_KEY = os.getenv("API_KEY", "your-api-key-here")
+
+
+def load_schema_relationships(domain):
+    """Load relation labels and constraints from DuckDB schema"""
+    # Create a pandas DataFrame with relation labels and constraints from DuckDB
+    schema_conn = duckdb.connect("schema_relationships.duckdb", read_only=True)
+    schema_result = schema_conn.execute(
+        f"SELECT subject as first_entity, predicate as relationship, object as second_entity FROM schema_relationships WHERE domain = 'base' OR domain = '{domain}'"
+    ).df()
+    examples = [EntityRelations(**row) for index, row in schema_result.iterrows()]
+
+    schema_conn.close()
+    print(f"Loaded {len(schema_result)} relations from schema_relationships.duckdb")
+    print(examples[:5])  # Print first 5 examples for debugging
+    return examples
 
 
 class EntityRelations(BaseModel):
@@ -25,11 +42,22 @@ class EntityExtraction(dspy.Signature):
     )
 
 
+class EntityExtractionModule(dspy.Module):
+    def __init__(self, examples):
+        self.extract = dspy.ChainOfThought(EntityExtraction)
+        self.examples = examples
+
+    def forward(self, text):
+        # DSPy will automatically use examples for few-shot prompting
+        with dspy.context(examples=self.examples[:5]):  # Use top 5 examples
+            return self.extract(text=text)
+
+
+module = EntityExtractionModule(load_schema_relationships("politics"))
+
+
 def extract_entities_and_relations(extractor, sentence):
-    prompt = f"Identify the main entities and their relationship in the sentence: '{sentence}'"
-    response = extractor(text=prompt).entities.model_dump()
-    keys = ["first_entity", "relationship", "second_entity"]
-    return tuple(response[key] for key in keys if key in response)
+    return module(sentence).entities
 
 
 def build_knowledge_graph(extractor, text):
