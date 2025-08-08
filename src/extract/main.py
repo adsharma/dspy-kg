@@ -13,7 +13,9 @@ from typing import List
 load_dotenv()
 
 # API configuration - loaded from environment variables or .env file
-API_BASE = os.getenv("API_BASE", "http://localhost:11434")
+# API_BASE: Only needed for local models like Ollama (default: http://localhost:11434)
+# For remote APIs (Gemini, OpenAI, Anthropic, etc.), leave API_BASE empty or unset
+API_BASE = os.getenv("API_BASE", "")  # Default to empty for remote APIs
 API_KEY = os.getenv("API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "ollama_chat/qwen3:30b")
 
@@ -96,11 +98,21 @@ def extract_entities_and_relations(module, sentence):
 
 def build_knowledge_graph(text):
     # Configure DSPy
-    lm = dspy.LM(
-        model=MODEL_NAME,
-        api_base=API_BASE,
-        api_key=API_KEY,
-    )
+    # Only set api_base for local models (like Ollama), not for remote APIs (Gemini, OpenAI, etc.)
+    if API_BASE and ("ollama" in MODEL_NAME.lower() or "localhost" in API_BASE):
+        # For local models like Ollama
+        lm = dspy.LM(
+            model=MODEL_NAME,
+            api_key=API_KEY,
+            api_base=API_BASE,
+        )
+    else:
+        # For remote APIs like Gemini, OpenAI, etc. - don't pass api_base
+        lm = dspy.LM(
+            model=MODEL_NAME,
+            api_key=API_KEY,
+        )
+
     dspy.configure(lm=lm)
 
     # Load schema and create extraction module
