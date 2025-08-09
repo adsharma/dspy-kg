@@ -55,6 +55,7 @@ class EntityRelations(BaseModel):
 
 class EntityExtractionWithSchema(dspy.Signature):
     text: str = dspy.InputField(desc="The text to extract entities from")
+    context: List[Entity] = dspy.InputField(desc="Previous entities for context. Do not create new entities if context is provided.")
     relationship_schema: str = dspy.InputField(
         desc="Valid relationship types from schema"
     )
@@ -93,7 +94,6 @@ class EntityExtraction(dspy.Module):
         ER = self.extract(
             text=text, relationship_schema=self.schema_string, context=self.context
         )
-        self.context.append(ER.entities)
         return ER
 
 
@@ -116,6 +116,7 @@ def build_knowledge_graph(text):
         lm = dspy.LM(
             model=MODEL_NAME,
             api_key=API_KEY,
+            max_tokens=8192,
         )
 
     dspy.configure(lm=lm)
@@ -151,6 +152,8 @@ def build_knowledge_graph(text):
     for sentence in sentences:
         try:
             ER = extract_entities_and_relations(module, sentence)
+            # Keep first 5 entities and most recent 5 entities for context
+            module.context = module.context[:5] + ER.entities[:5]
             print(f"Extracted: {ER}")
 
             # Add entities to the graph
